@@ -20,6 +20,8 @@
 #                          - iOS: Device name (e.g., "iPhone 15 Pro") or UDID
 #                          - Android: Serial number (e.g., "emulator-5554")
 #   --list, -l             List all available devices for the platform
+#   --quality, -q <0-100>   Scale output based on original size (percentage)
+#   --max-size, -m <px>     Resize so max dimension is <= px (preserves aspect ratio)
 #   --json, -j             Output results in JSON format (recommended for AI agents)
 #   --help, -h             Show help message
 #
@@ -102,6 +104,8 @@ OUTPUT_PATH=""
 DEVICE_ID=""
 LIST_DEVICES=false
 JSON_OUTPUT=false
+QUALITY=""
+MAX_SIZE=""
 
 # Pre-scan for --json flag (needed before parsing other args)
 for arg in "$@"; do
@@ -149,6 +153,180 @@ output_json() {
     echo "}"
 }
 
+# Normalize quality input (accepts 0-100 or 0-100%)
+normalize_quality() {
+    local input="$1"
+    input="${input%%%}"
+    if [ -z "$input" ] || ! [[ "$input" =~ ^[0-9]+$ ]]; then
+        log_error "❌ Error: Invalid quality '$1'. Expected 0-100."
+        if $JSON_OUTPUT; then
+            output_json "error" "Invalid quality: $1"
+        fi
+        exit 1
+    fi
+    if [ "$input" -lt 0 ] || [ "$input" -gt 100 ]; then
+        log_error "❌ Error: Quality out of range '$1'. Expected 0-100."
+        if $JSON_OUTPUT; then
+            output_json "error" "Quality out of range: $1"
+        fi
+        exit 1
+    fi
+    QUALITY="$input"
+}
+
+normalize_max_size() {
+    local input="$1"
+    if [ -z "$input" ] || ! [[ "$input" =~ ^[0-9]+$ ]]; then
+        log_error "❌ Error: Invalid max size '$1'. Expected a pixel value."
+        if $JSON_OUTPUT; then
+            output_json "error" "Invalid max size: $1"
+        fi
+        exit 1
+    fi
+    if [ "$input" -lt 1 ]; then
+        log_error "❌ Error: Max size must be >= 1."
+        if $JSON_OUTPUT; then
+            output_json "error" "Max size out of range: $1"
+        fi
+        exit 1
+    fi
+    MAX_SIZE="$input"
+}
+
+make_temp_path() {
+    local input_path="$1"
+    local tag="$2"
+    local extension=""
+    local base_path="$input_path"
+
+    if [[ "$input_path" == *.* ]]; then
+        extension="${input_path##*.}"
+        extension=$(echo "$extension" | tr '[:upper:]' '[:lower:]')
+        base_path="${input_path%.*}"
+    else
+        extension="png"
+    fi
+
+    echo "${base_path}.${tag}.${extension}"
+}
+
+# Get max dimension of image (width or height)
+get_image_max_dimension() {
+    local input_path="$1"
+    local width=""
+    local height=""
+
+    if command -v sips &> /dev/null; then
+        width=$(sips -g pixelWidth "$input_path" 2>/dev/null | awk '/pixelWidth/ {print $2}')
+        height=$(sips -g pixelHeight "$input_path" 2>/dev/null | awk '/pixelHeight/ {print $2}')
+    elif command -v magick &> /dev/null; then
+        local dims
+        dims=$(magick identify -format '%w %h' "$input_path" 2>/dev/null)
+        read -r width height <<<"$dims"
+    elif command -v identify &> /dev/null; then
+        local dims
+        dims=$(identify -format '%w %h' "$input_path" 2>/dev/null)
+        read -r width height <<<"$dims"
+    fi
+
+    if [ -z "$width" ] || [ -z "$height" ]; then
+        return 1
+    fi
+
+    if [ "$width" -ge "$height" ]; then
+        echo "$width"
+    else
+        echo "$height"
+    fi
+}
+
+# Compute max size from quality percentage
+compute_quality_max_size() {
+    local input_path="$1"
+    local quality="$2"
+    local max_dim
+
+    max_dim=$(get_image_max_dimension "$input_path") || return 1
+    local target=$(( max_dim * quality / 100 ))
+    if [ "$target" -lt 1 ]; then
+        target=1
+    fi
+    echo "$target"
+}
+
+# Resolve final resize target based on quality and max size
+resolve_resize_target() {
+    local input_path="$1"
+    local target="$MAX_SIZE"
+
+    if [ -n "$QUALITY" ]; then
+        local quality_target
+        if ! quality_target=$(compute_quality_max_size "$input_path" "$QUALITY"); then
+            log_error "❌ Error: Unable to read image dimensions for quality scaling"
+            if $JSON_OUTPUT; then
+                output_json "error" "Unable to read image dimensions for quality scaling"
+            fi
+            exit 1
+        fi
+
+        if [ -n "$target" ]; then
+            if [ "$quality_target" -lt "$target" ]; then
+                target="$quality_target"
+            fi
+        else
+            target="$quality_target"
+        fi
+    fi
+
+    echo "$target"
+}
+
+# Resize image in place using available tools
+resize_image() {
+    local input_path="$1"
+    local max_size="$2"
+    local temp_path
+    local attempted_any=false
+
+    temp_path=$(make_temp_path "$input_path" "resize")
+
+    if [ -z "$max_size" ]; then
+        return 0
+    fi
+
+    if command -v magick &> /dev/null; then
+        attempted_any=true
+        if magick "$input_path" -resize "${max_size}x${max_size}>" "$temp_path"; then
+            mv "$temp_path" "$input_path"
+            log "📉 Resized screenshot using ImageMagick (max ${max_size}px)."
+            return 0
+        fi
+        rm -f "$temp_path"
+    elif command -v convert &> /dev/null; then
+        attempted_any=true
+        if convert "$input_path" -resize "${max_size}x${max_size}>" "$temp_path"; then
+            mv "$temp_path" "$input_path"
+            log "📉 Resized screenshot using ImageMagick (max ${max_size}px)."
+            return 0
+        fi
+        rm -f "$temp_path"
+    elif command -v sips &> /dev/null; then
+        attempted_any=true
+        if sips -Z "$max_size" "$input_path" --out "$temp_path" >/dev/null; then
+            mv "$temp_path" "$input_path"
+            log "📉 Resized screenshot using sips (max ${max_size}px)."
+            return 0
+        fi
+        rm -f "$temp_path"
+    fi
+
+    if $attempted_any; then
+        log "⚠️ Resize skipped; keeping original screenshot."
+    else
+        log "ℹ️ No resize tool available; skipping resize."
+    fi
+}
+
 # Parse arguments
 shift || true
 while [[ $# -gt 0 ]]; do
@@ -165,6 +343,28 @@ while [[ $# -gt 0 ]]; do
             JSON_OUTPUT=true
             shift
             ;;
+        --quality|-q)
+            if [ -z "${2:-}" ]; then
+                log_error "❌ Error: --quality requires a value (0-100)"
+                if $JSON_OUTPUT; then
+                    output_json "error" "Missing quality value"
+                fi
+                exit 1
+            fi
+            normalize_quality "$2"
+            shift 2
+            ;;
+        --max-size|-m)
+            if [ -z "${2:-}" ]; then
+                log_error "❌ Error: --max-size requires a value (pixels)"
+                if $JSON_OUTPUT; then
+                    output_json "error" "Missing max size value"
+                fi
+                exit 1
+            fi
+            normalize_max_size "$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [ios|android] [output_path] [options]"
             echo ""
@@ -175,6 +375,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --id, -i      Device ID (UDID for iOS, serial for Android)"
             echo "  --list, -l    List available devices/simulators"
+            echo "  --quality, -q Scale output based on original size (0-100)"
+            echo "  --max-size, -m Resize so max dimension is <= px"
             echo "  --json, -j    Output result in JSON format"
             echo "  --help, -h    Show this help message"
             echo ""
@@ -183,6 +385,8 @@ while [[ $# -gt 0 ]]; do
             echo "  $0 ios screenshot.png --id 'iPhone 15 Pro'"
             echo "  $0 ios screenshot.png --id XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
             echo "  $0 android ./screens/android.png --id emulator-5554"
+            echo "  $0 ios screenshot.png --quality 60"
+            echo "  $0 ios screenshot.png --max-size 1600"
             echo "  $0 ios --list"
             echo "  $0 android --list"
             exit 0
@@ -352,6 +556,9 @@ take_ios_screenshot() {
     xcrun simctl io "$target" screenshot "$OUTPUT_PATH"
     
     if [ $? -eq 0 ]; then
+        local resize_target
+        resize_target=$(resolve_resize_target "$OUTPUT_PATH")
+        resize_image "$OUTPUT_PATH" "$resize_target"
         FULL_PATH=$(realpath "$OUTPUT_PATH")
         log "✅ iOS screenshot saved to: $FULL_PATH"
         if $JSON_OUTPUT; then
@@ -415,6 +622,9 @@ take_android_screenshot() {
     adb $adb_target shell rm "$TEMP_PATH"
     
     if [ $? -eq 0 ]; then
+        local resize_target
+        resize_target=$(resolve_resize_target "$OUTPUT_PATH")
+        resize_image "$OUTPUT_PATH" "$resize_target"
         FULL_PATH=$(realpath "$OUTPUT_PATH")
         log "✅ Android screenshot saved to: $FULL_PATH"
         if $JSON_OUTPUT; then
